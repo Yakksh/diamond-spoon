@@ -128,9 +128,15 @@ def run(opens: pd.DataFrame, closes: pd.DataFrame, start: int, end: int,
         rebalance_rows: set[int], decide: Decider, capital: float, cost: float,
         cash_yield: float = 0.0) -> dict:
     """Trade rows start..end inclusive. On a rebalance row r, decide(r - 1, held,
-    tradeable) names the stocks to hold, using data up to row r - 1 only."""
+    tradeable) names the stocks to hold, using data up to row r - 1 only.
+
+    A stock whose prices stop (delisted, merged) is sold at its last close. For a
+    merger that is about what holders got; after a collapse they may have got less."""
     book = Book(capital, cost)
     marks = closes.ffill()
+    last_row: dict[int, list[str]] = {}
+    for name, d in closes.apply(pd.Series.last_valid_index).dropna().items():
+        last_row.setdefault(closes.index.get_loc(d), []).append(name)
     daily = (1 + cash_yield) ** (1 / YEAR)
     dates = closes.index
     equity = np.empty(end - start + 1)
@@ -150,6 +156,10 @@ def run(opens: pd.DataFrame, closes: pd.DataFrame, start: int, end: int,
             budget = book.cash / len(new) if new else 0.0
             for name in new:
                 book.buy(name, budget, px[name], d)
+        if r < end:
+            for name in last_row.get(r, []):
+                if name in book.lots:
+                    book.sell(name, marks.iloc[r][name], d)
         equity[k] = book.value(marks.iloc[r])
         in_cash += book.cash > 0.5 * equity[k]
 
@@ -171,8 +181,14 @@ def run(opens: pd.DataFrame, closes: pd.DataFrame, start: int, end: int,
     }
 
 
+Members = Callable[[int], set[str]]
+
+
 def momentum_decider(closes: pd.DataFrame, top: int, exit_rank: int, lookback: int,
-                     skip: int, risk_on: pd.Series | None = None) -> tuple[Decider, pd.DataFrame]:
+                     skip: int, risk_on: pd.Series | None = None,
+                     members: Members | None = None) -> tuple[Decider, pd.DataFrame]:
+    """Rank by past return; with `members`, only stocks on that date's list count,
+    and a holding that drops off the list is sold."""
     marks = closes.ffill(limit=5)
     score = marks.shift(skip) / marks.shift(lookback) - 1
     score[closes.isna()] = np.nan                 # no rank for a stock that is not trading
@@ -180,13 +196,37 @@ def momentum_decider(closes: pd.DataFrame, top: int, exit_rank: int, lookback: i
     def decide(row: int, held: list[str], tradeable: set[str]) -> list[str]:
         if risk_on is not None and not risk_on.iloc[row]:
             return []
-        s = score.iloc[row].dropna().sort_values(ascending=False)
+        s = score.iloc[row].dropna()
+        if members is not None:
+            s = s[s.index.isin(members(row))]
+        s = s.sort_values(ascending=False)
         rank = {n: i + 1 for i, n in enumerate(s.index)}
-        keep = [n for n in held if rank.get(n, len(rank) + 1) <= exit_rank]
+        keep = [n for n in held if n in rank and rank[n] <= exit_rank]
         new = [n for n in s.index if n not in keep and n in tradeable]
         return keep + new[:max(top - len(keep), 0)]
 
     return decide, score
+
+
+def hold_members(members: Members) -> Decider:
+    """Hold every stock on the list as it stood that month: a leaver is sold and
+    its money split among the joiners (an equal-weight index, roughly)."""
+    def decide(row: int, held: list[str], tradeable: set[str]) -> list[str]:
+        now = members(row)
+        return [n for n in held if n in now] + sorted((now - set(held)) & tradeable)
+    return decide
+
+
+def nse_members(uni: pd.DataFrame, index: pd.DatetimeIndex) -> Members:
+    """The point-in-time list (nse.py) as it stood on each row's date."""
+    by_date = {d: set(g["stock"]) for d, g in uni.groupby("date")}
+    dates = np.array(sorted(by_date), dtype="datetime64[ns]")
+
+    def members(row: int) -> set[str]:
+        i = np.searchsorted(dates, index[row].to_datetime64(), side="right") - 1
+        return by_date[pd.Timestamp(dates[i])] if i >= 0 else set()
+
+    return members
 
 
 def buy_once(names: list[str] | None = None) -> Decider:
@@ -202,6 +242,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("names", nargs="*", help="NSE symbols (default: --universe)")
     ap.add_argument("--universe", choices=universe.UNIVERSES, default="all")
+    ap.add_argument("--pit", action="store_true", help="use the point-in-time list from "
+                    "NSE's files (nse.py) instead of --universe: no survivorship bias")
+    ap.add_argument("--pit-size", type=int, default=50, help="size of that list")
     ap.add_argument("--years", type=int, default=10)
     ap.add_argument("--top", type=int, default=10, help="how many stocks to hold")
     ap.add_argument("--exit-rank", type=int, help="sell once rank is worse than this "
@@ -217,17 +260,26 @@ def main() -> None:
     args = ap.parse_args()
     exit_rank = args.exit_rank or args.top
 
-    names = universe.resolve(args.names, args.universe)
+    uni = None
+    if args.pit:
+        import nse
+        uni = nse.load_universe()
+        uni = uni[uni["rank"] <= args.pit_size]
+        names = sorted(uni["stock"].unique())
+    else:
+        names = universe.resolve(args.names, args.universe)
     print(f"Loading {len(names)} stocks + {universe.BENCHMARK}...", file=sys.stderr)
-    data = universe.load_many(names + [universe.BENCHMARK])
+    data = universe.load_many(names + [universe.BENCHMARK], nse_fallback=args.pit)
     bench = data.pop(universe.BENCHMARK)
+    missing = sorted(set(names) - set(data))
     closes = pd.DataFrame({n: df["Close"] for n, df in data.items()}).sort_index()
     opens = pd.DataFrame({n: df["Open"] for n, df in data.items()}).reindex(closes.index)
     bclose = bench["Close"].reindex(closes.index).ffill()
     bopen = bench["Open"].reindex(closes.index)
     risk_on = (bclose > bclose.rolling(200).mean()) if args.market_filter else None
+    members = nse_members(uni, closes.index) if args.pit else None
     decide, score = momentum_decider(closes, args.top, exit_rank, args.lookback * MONTH,
-                                     args.skip * MONTH, risk_on)
+                                     args.skip * MONTH, risk_on, members)
 
     label = (f"Momentum top {args.top}, exit rank {exit_rank}, {args.lookback}-{args.skip}"
              + (", market filter" if args.market_filter else ""))
@@ -237,11 +289,17 @@ def main() -> None:
         start = int(np.searchsorted(closes.index, a))
         end = int(np.searchsorted(closes.index, b, side="right")) - 1
         rebal = {r for r in month_start if start < r <= end} | {start + 1}
+        if args.pit:
+            ew_label = f"Equal-weight point-in-time top {args.pit_size}, updated monthly"
+            ew = run(opens, closes, start, end, rebal, hold_members(members), args.capital,
+                     args.cost)
+        else:
+            ew_label = f"Equal-weight buy & hold ({len(data)} stocks)"
+            ew = run(opens, closes, start, end, {start + 1}, buy_once(), args.capital, args.cost)
         lines = {
             label: run(opens, closes, start, end, rebal, decide, args.capital, args.cost,
                        args.cash_yield),
-            f"Equal-weight buy & hold ({len(data)} stocks)":
-                run(opens, closes, start, end, {start + 1}, buy_once(), args.capital, args.cost),
+            ew_label: ew,
             f"{universe.BENCHMARK} buy & hold":
                 run(bopen.to_frame("B"), bclose.to_frame("B"), start, end, {start + 1},
                     buy_once(), args.capital, args.cost),
@@ -262,8 +320,16 @@ def main() -> None:
           f"12-1 month return):")
     print("  " + ", ".join(f"{n} {100 * s[n]:+.0f}%" for n in held) if held
           else "  none (market filter says cash)")
-    print("Survivorship bias: the list is today's names plus hand-picked fallen ones; "
-          "see universe.py.")
+    if args.pit:
+        gone = uni[uni["stock"].isin(missing)]
+        print(f"Point-in-time list: {len(names)} different stocks were on it; "
+              f"{len(missing)} had no prices anywhere and are left out "
+              f"({100 * len(gone) / len(uni):.1f}% of the list's stock-months): "
+              + (", ".join(missing) or "none") + ". Prices rebuilt from NSE's files "
+              "leave out dividends.")
+    else:
+        print("Survivorship bias: the list is today's names plus hand-picked fallen ones; "
+              "see universe.py. Use --pit for NSE's point-in-time list.")
 
 
 if __name__ == "__main__":

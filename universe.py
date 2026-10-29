@@ -19,6 +19,7 @@ adjusted) and re-downloaded once they are more than `max_age_hours` old.
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from pathlib import Path
@@ -51,13 +52,16 @@ def yahoo_symbol(name: str) -> str:
     return name if "." in name or name.startswith("^") else f"{name}.NS"
 
 
-def load(name: str, max_age_hours: float = 12, retries: int = 3) -> pd.DataFrame:
-    path = DATA_DIR / f"{name}.csv"
+def load(name: str, max_age_hours: float = 12, retries: int = 2) -> pd.DataFrame:
+    path, gone = DATA_DIR / f"{name}.csv", DATA_DIR / f"{name}.missing"
     if path.exists() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
         return load_csv(str(path))
+    if gone.exists() and time.time() - gone.stat().st_mtime < 24 * 3600:
+        raise ValueError(f"no Yahoo data for {name} (checked in the last day)")
 
     import yfinance as yf
 
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # its own error spam
     df = pd.DataFrame()
     for attempt in range(retries):
         try:
@@ -72,7 +76,9 @@ def load(name: str, max_age_hours: float = 12, retries: int = 3) -> pd.DataFrame
         if path.exists():
             print(f"  {name}: download failed, using the cached copy", file=sys.stderr)
             return load_csv(str(path))
-        raise ValueError(f"no data for {name} ({yahoo_symbol(name)})")
+        DATA_DIR.mkdir(exist_ok=True)
+        gone.touch()
+        raise ValueError(f"no Yahoo data for {name} ({yahoo_symbol(name)})")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = _clean(df)
@@ -85,13 +91,26 @@ def load(name: str, max_age_hours: float = 12, retries: int = 3) -> pd.DataFrame
     return df
 
 
-def load_many(names: list[str], max_age_hours: float = 12) -> dict[str, pd.DataFrame]:
+def load_many(names: list[str], max_age_hours: float = 12,
+              nse_fallback: bool = False) -> dict[str, pd.DataFrame]:
+    """Yahoo prices for each name. With nse_fallback, a name Yahoo lacks (delisted,
+    merged) is rebuilt from NSE's own files instead (nse.price_series)."""
     out = {}
     for name in names:
         try:
             out[name] = load(name, max_age_hours)
         except ValueError as e:
-            print(f"  skipped: {e}", file=sys.stderr)
+            if not nse_fallback:
+                print(f"  skipped: {e}", file=sys.stderr)
+                continue
+            import nse
+            try:
+                out[name], notes = nse.price_series(name)
+                print(f"  {name}: not on Yahoo, prices rebuilt from NSE's files", file=sys.stderr)
+                for note in notes:
+                    print(f"    {note}", file=sys.stderr)
+            except ValueError as e2:
+                print(f"  skipped: {e}; {e2}", file=sys.stderr)
     return out
 
 

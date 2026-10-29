@@ -8,6 +8,9 @@ pip install -r requirements.txt
 python swing_backtest.py RELIANCE.NS --years 10 --walkforward   # one stock, every rule
 python evaluate.py --cash-yield 0.06                            # every rule, 60 stocks
 python rotation.py --top 10 --exit-rank 20                      # momentum rotation
+python odds.py RELIANCE --cost-basis 900 --bought 2021-03-15 --qty 100   # sell now, buy back lower?
+python nse.py download && python nse.py build                   # point-in-time stock list
+python rotation.py --pit --top 10 --exit-rank 20                # rotation on that list
 python -m pytest                                                # offline tests
 ```
 
@@ -16,7 +19,9 @@ python -m pytest                                                # offline tests
 | `swing_backtest.py` | One stock: how did each rule do against buy & hold, and does it survive a walk-forward test? Holds the engine, the rules and the tax model. |
 | `evaluate.py` | Many stocks: how often does each rule beat buy & hold, does a buy or sell signal tell you anything about the price 1-6 months later, and when a rule sold, was the buyback cheaper? |
 | `rotation.py` | Instead of timing one stock, hold the strongest N each month (12-1 momentum), against equal-weight buy & hold of the same list and the NIFTYBEES ETF. |
-| `universe.py` | The stock lists and a disk cache of Yahoo prices (`data/`, not committed). |
+| `odds.py` | If I sell now, what are the odds I can buy back cheaper? Tests "sell at the next open, leave a limit order X% lower for N days, else buy back on day N" four ways: simulated from the stock's own past days (with and without its past drift), on every real past day, and on past days that looked like today. Includes the tax on selling. |
+| `nse.py` | Downloads NSE's daily files (every listed stock, including later delisted ones) and builds a point-in-time list: each month, the 50 most traded stocks among those with futures. Removes the survivorship bias of a hand-made list. Rebuilds prices from NSE's files for stocks Yahoo no longer carries. |
+| `universe.py` | The hand-made stock lists and a disk cache of Yahoo prices (`data/`, not committed). |
 
 ## What the tests have shown so far (data to 28 Oct 2026)
 
