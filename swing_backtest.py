@@ -2,7 +2,7 @@
 """
 swing_backtest.py - can a rules-based system "catch the peaks" of a stock?
 
-It runs five things on the same price history and compares them honestly:
+It runs seven things on the same price history and compares them honestly:
 
   ORACLE (hindsight)  Buys every major trough and sells every major peak, found
                       with scipy.signal.find_peaks on the WHOLE series. It uses
@@ -21,6 +21,11 @@ It runs five things on the same price history and compares them honestly:
   MEAN REVERSION      Buys panic: close below the lower Bollinger Band (20, 2)
                       with RSI(14) under 30. Sells at the middle band or RSI > 70,
                       with a -10% stop and a 40-day time stop.
+  200-DAY TREND       Holds while the close is above its 200-day average. A band
+                      (default 2%) on either side cuts the in-out whipsaw.
+  UPTREND DIP         Buys a sharp 2-day dip (RSI(2) under 10) while the close is
+                      above the 200-day average. Sells when the close gets back
+                      above the 5-day average, or after 10 days.
   BUY & HOLD          The benchmark every other line has to beat.
 
 Realism built in
@@ -30,7 +35,13 @@ Realism built in
     DP charge and a little slippage, approximately - check your broker).
   * Indian capital-gains tax on listed equity, netted per financial year:
     STCG 20% if held <= 12 months, LTCG 12.5% above Rs 1.25 lakh/FY, + 4% cess.
+    Losses carry forward (short-term losses offset any gain, long-term losses
+    only long-term gains). Today's rates are applied to the whole history.
     Rates as of FY 2026-27; update the constants if a Budget changes them.
+  * --cash-yield lets money earn interest while a strategy is out of the stock
+    (e.g. 0.06 for a liquid fund). Tax on that interest is not modelled.
+  * Yahoo serves today's bar while NSE is still trading; it is dropped until
+    16:00 IST, so a live price is never mistaken for a close.
   * --walkforward tunes each strategy's main knob on the first 60% of the data
     and reports it on the unseen last 40%. If a strategy only wins in-sample,
     it was fitted to noise.
@@ -40,7 +51,10 @@ Usage
   python swing_backtest.py RELIANCE.NS
   python swing_backtest.py RELIANCE.NS TCS.NS HDFCBANK.NS --years 10 --walkforward
   python swing_backtest.py RELIANCE.NS --plot reliance.png
+  python swing_backtest.py RELIANCE.NS --cash-yield 0.06
   python swing_backtest.py --csv prices.csv          # Date + Close (Open/High/Low optional)
+
+  For many stocks at once see evaluate.py; for rotating between stocks see rotation.py.
 
 NSE tickers end in .NS on Yahoo Finance (BSE: .BO). Prices are split/bonus
 adjusted (auto_adjust=True); if you use your own CSV, make sure it is adjusted
@@ -77,7 +91,20 @@ def load_yahoo(ticker: str, years: int) -> pd.DataFrame:
         raise SystemExit(f"No data for {ticker}. Check the symbol (NSE needs .NS).")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    return _clean(df)
+    out = _clean(df)
+    if out.attrs.get("bad_ticks"):
+        print(f"{ticker}: dropped bad bars from Yahoo on {out.attrs['bad_ticks']}",
+              file=sys.stderr)
+    return drop_live_bar(out)
+
+
+def drop_live_bar(df: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Drop today's bar until NSE has closed (15:30 IST, plus a margin): before
+    then Yahoo's 'Close' is just the latest traded price."""
+    now = now if now is not None else pd.Timestamp.now(tz="Asia/Kolkata")
+    if len(df) and df.index[-1].date() == now.date() and now.hour < 16:
+        return df.iloc[:-1]
+    return df
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -99,7 +126,30 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     if "Close" not in keep:
         raise SystemExit("Data needs at least a Close column.")
     out = df[keep].apply(pd.to_numeric, errors="coerce").dropna()
+    out = out[(out > 0).all(axis=1)]
     out.index = pd.to_datetime(out.index).tz_localize(None)
+    return drop_bad_ticks(out)
+
+
+def drop_bad_ticks(df: pd.DataFrame, factor: float = 1.8, max_len: int = 3) -> pd.DataFrame:
+    """Drop runs of up to `max_len` bars that sit `factor`x or more away from the
+    bars on both sides, e.g. Yahoo's NIFTYBEES on 19-20 Dec 2019 at a tenth of
+    the real price. Real crashes don't snap back to within 5% in days, so they
+    stay. Dropped dates are listed in df.attrs["bad_ticks"]."""
+    lc = np.log(df["Close"].to_numpy())
+    far, back = np.log(factor), 0.05
+    bad: list[int] = []
+    for i in np.flatnonzero(np.abs(np.diff(lc)) > far):   # bar i -> i+1 is a big jump
+        if bad and i <= bad[-1]:
+            continue
+        for n in range(1, max_len + 1):                   # bars i+1..i+n off, i+n+1 back
+            j = i + n + 1
+            if j < len(lc) and abs(lc[j] - lc[i]) < back and \
+                    all(abs(lc[k] - lc[i]) > far for k in range(i + 1, j)):
+                bad.extend(range(i + 1, j))
+                break
+    out = df.drop(df.index[bad])
+    out.attrs["bad_ticks"] = [d.date() for d in df.index[bad]]
     return out
 
 
@@ -192,6 +242,38 @@ def strat_meanrev(df: pd.DataFrame, rsi_buy: float = 30, n: int = 20, nstd: floa
     return pd.Series(tgt, df.index)
 
 
+def strat_sma200(df: pd.DataFrame, band: float = 0.02, n: int = 200) -> pd.Series:
+    c = df["Close"].to_numpy()
+    sma = df["Close"].rolling(n).mean().to_numpy()
+    tgt = np.zeros(len(c))
+    pos = 0
+    for i, px in enumerate(c):
+        if pos == 0 and px > sma[i] * (1 + band):      # NaN compares False
+            pos = 1
+        elif pos == 1 and px < sma[i] * (1 - band):
+            pos = 0
+        tgt[i] = pos
+    return pd.Series(tgt, df.index)
+
+
+def strat_dip(df: pd.DataFrame, rsi2: float = 10, max_days: int = 10) -> pd.Series:
+    c = df["Close"]
+    sma200, sma5 = c.rolling(200).mean().to_numpy(), c.rolling(5).mean().to_numpy()
+    r, cv = rsi(c, 2).to_numpy(), c.to_numpy()
+    tgt = np.zeros(len(cv))
+    pos, days = 0, 0
+    for i, px in enumerate(cv):
+        if pos == 0:
+            if px > sma200[i] and r[i] < rsi2:
+                pos, days = 1, 0
+        else:
+            days += 1
+            if px > sma5[i] or days >= max_days:
+                pos = 0
+        tgt[i] = pos
+    return pd.Series(tgt, df.index)
+
+
 def strat_buyhold(df: pd.DataFrame) -> pd.Series:
     return pd.Series(1.0, df.index)
 
@@ -278,26 +360,47 @@ def fy_of(d: pd.Timestamp) -> int:
     return d.year if d.month >= 4 else d.year - 1
 
 
-def capital_gains_tax(trades: list[Trade]) -> float:
+def tax_by_fy(realized: list[tuple[pd.Timestamp, float, bool]]) -> dict[int, float]:
+    """Capital-gains tax owed for each financial year.
+
+    `realized` holds (sale date, gain in rupees, held > 12 months). A short-term
+    loss offsets short- or long-term gains; a long-term loss only long-term gains.
+    Whatever is left unused carries forward to later years (the 8-year limit on
+    carry-forward is ignored)."""
     by_fy: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])   # [short, long]
-    for t in trades:
-        long_term = (t.exit_date - t.entry_date).days > 365
-        by_fy[fy_of(t.exit_date)][1 if long_term else 0] += t.pnl
-    total = 0.0
-    for st, lt in by_fy.values():
-        if st < 0:              # short-term loss can offset long-term gain...
+    for d, gain, long_term in realized:
+        by_fy[fy_of(d)][1 if long_term else 0] += gain
+    out: dict[int, float] = {}
+    st_cf = lt_cf = 0.0                  # losses carried forward, as positive numbers
+    for fy in sorted(by_fy):
+        st, lt = by_fy[fy]
+        if st < 0:                       # this year's short-term loss hits long-term gain...
             lt, st = lt + st, 0.0
-        # ...but a long-term loss cannot offset a short-term gain.
-        total += (STCG_RATE * max(st, 0) + LTCG_RATE * max(lt - LTCG_EXEMPT, 0)) * (1 + CESS)
-    return total
+        use = min(st_cf, st)             # ...and so do short-term losses carried in
+        st, st_cf = st - use, st_cf - use
+        use = min(st_cf, max(lt, 0))
+        lt, st_cf = lt - use, st_cf - use
+        use = min(lt_cf, max(lt, 0))     # long-term losses only ever touch long-term gains
+        lt, lt_cf = lt - use, lt_cf - use
+        if lt < 0:
+            lt_cf, lt = lt_cf - lt, 0.0
+        out[fy] = (STCG_RATE * st + LTCG_RATE * max(lt - LTCG_EXEMPT, 0)) * (1 + CESS)
+    return out
+
+
+def capital_gains_tax(trades: list[Trade]) -> float:
+    return sum(tax_by_fy([(t.exit_date, t.pnl, (t.exit_date - t.entry_date).days > 365)
+                          for t in trades]).values())
 
 
 def backtest(df: pd.DataFrame, target: pd.Series, name: str, capital: float = 100_000,
-             cost: float = DEFAULT_COST, same_close: bool = False) -> Result:
+             cost: float = DEFAULT_COST, same_close: bool = False,
+             cash_yield: float = 0.0) -> Result:
     close = df["Close"].to_numpy()
     fill_px = close if same_close or "Open" not in df else df["Open"].to_numpy()
     tgt = target.to_numpy()
     dates = df.index
+    daily = (1 + cash_yield) ** (1 / 252)
 
     cash, shares = capital, 0.0
     entry_date, entry_cost, entry_px = None, 0.0, 0.0
@@ -310,6 +413,8 @@ def backtest(df: pd.DataFrame, target: pd.Series, name: str, capital: float = 10
         # Decision made at the close of day i-1 is filled today (oracle: same day).
         want = tgt[i] if same_close else (tgt[i - 1] if i > 0 else 0)
         px = fill_px[i]
+        if i > 0 and shares == 0:      # idle cash earned a day's interest overnight
+            cash *= daily
         if want == 1 and shares == 0:
             shares = cash / (px * (1 + cost))          # fractional shares for simplicity
             entry_cost, entry_px, entry_date = cash, px, dates[i]
@@ -342,27 +447,31 @@ STRATS = {
     "Zigzag swing": (strat_zigzag, "pct", [5, 7.5, 10, 12.5, 15, 20], 10.0),
     "Trend + ATR stop": (strat_trend, "k", [2, 3, 4, 5], 3.0),
     "Mean reversion": (strat_meanrev, "rsi_buy", [25, 30, 35], 30),
+    "200-day trend": (strat_sma200, "band", [0, 0.01, 0.02, 0.05], 0.02),
+    "Uptrend dip": (strat_dip, "rsi2", [5, 10, 15], 10),
 }
 
 
 def run_all(df: pd.DataFrame, start: pd.Timestamp, capital: float, cost: float,
-            prom_pct: float, params: dict | None = None) -> list[Result]:
+            prom_pct: float, params: dict | None = None,
+            cash_yield: float = 0.0) -> list[Result]:
     """Compute signals on the full history (warm-up included), trade from `start`."""
     params = params or {}
     window = df.index >= start
     ev = df[window]
     results = [backtest(ev, strat_oracle(ev, prom_pct), "ORACLE (hindsight, untradeable)",
-                        capital, cost, same_close=True)]
+                        capital, cost, same_close=True, cash_yield=cash_yield)]
     for name, (fn, knob, _grid, default) in STRATS.items():
         val = params.get(name, default)
         sig = fn(df, **{knob: val})[window]
-        results.append(backtest(ev, sig, f"{name} ({knob}={val:g})", capital, cost))
+        results.append(backtest(ev, sig, f"{name} ({knob}={val:g})", capital, cost,
+                                cash_yield=cash_yield))
     results.append(backtest(ev, strat_buyhold(ev), "Buy & hold", capital, cost))
     return results
 
 
 def walk_forward(df: pd.DataFrame, start: pd.Timestamp, capital: float, cost: float,
-                 train_frac: float = 0.6) -> pd.DataFrame:
+                 train_frac: float = 0.6, cash_yield: float = 0.0) -> pd.DataFrame:
     ev_idx = df.index[df.index >= start]
     split = ev_idx[int(len(ev_idx) * train_frac)]
     train = (df.index >= start) & (df.index < split)
@@ -372,11 +481,11 @@ def walk_forward(df: pd.DataFrame, start: pd.Timestamp, capital: float, cost: fl
         scored = []
         for val in grid:
             sig = fn(df, **{knob: val})
-            r = backtest(df[train], sig[train], name, capital, cost)
+            r = backtest(df[train], sig[train], name, capital, cost, cash_yield=cash_yield)
             scored.append((r.equity.iloc[-1] - r.tax, val))
         best = max(scored)[1]
         sig = fn(df, **{knob: best})
-        r = backtest(df[test], sig[test], name, capital, cost)
+        r = backtest(df[test], sig[test], name, capital, cost, cash_yield=cash_yield)
         s = r.summary()
         rows.append({"strategy": f"{name} ({knob}={best:g}, picked in-sample)",
                      "out-of-sample after tax %": s["after tax %"],
@@ -438,6 +547,8 @@ def main() -> None:
     ap.add_argument("--cost", type=float, default=DEFAULT_COST, help="per side, 0.0015 = 0.15%%")
     ap.add_argument("--prominence", type=float, default=12.0,
                     help="oracle: min swing size, %% of median price")
+    ap.add_argument("--cash-yield", type=float, default=0.0,
+                    help="yearly interest on idle cash, 0.06 = 6%%")
     ap.add_argument("--walkforward", action="store_true")
     ap.add_argument("--plot", help="save a chart (single ticker) to this PNG path")
     args = ap.parse_args()
@@ -457,13 +568,16 @@ def main() -> None:
             print("Note: no warm-up history before the window, so the trend strategy "
                   "(needs ~200 days) sits out the start.", file=sys.stderr)
         start = df.index[df.index >= start][0]
-        results = run_all(df, start, args.capital, args.cost, args.prominence)
+        results = run_all(df, start, args.capital, args.cost, args.prominence,
+                          cash_yield=args.cash_yield)
         table = pd.DataFrame([r.summary() for r in results]).set_index("strategy")
         print(f"\n=== {label}: {start.date()} -> {df.index[-1].date()} | capital "
-              f"Rs {args.capital:,.0f} | cost {args.cost:.2%}/side ===")
+              f"Rs {args.capital:,.0f} | cost {args.cost:.2%}/side | idle cash "
+              f"{args.cash_yield:.1%}/yr ===")
         print(table.to_string())
         if args.walkforward:
-            print(walk_forward(df, start, args.capital, args.cost).to_string())
+            print(walk_forward(df, start, args.capital, args.cost,
+                               cash_yield=args.cash_yield).to_string())
         if args.plot:
             plot(df, start, results, args.prominence, args.plot,
                  f"{label}: hindsight swings vs real-time zigzag signals")
