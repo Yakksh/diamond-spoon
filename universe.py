@@ -55,7 +55,7 @@ def yahoo_symbol(name: str) -> str:
 def load(name: str, max_age_hours: float = 12, retries: int = 2) -> pd.DataFrame:
     path, gone = DATA_DIR / f"{name}.csv", DATA_DIR / f"{name}.missing"
     if path.exists() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
-        return load_csv(str(path))
+        return _report(name, load_csv(str(path)))
     if gone.exists() and time.time() - gone.stat().st_mtime < 24 * 3600:
         raise ValueError(f"no Yahoo data for {name} (checked in the last day)")
 
@@ -81,13 +81,22 @@ def load(name: str, max_age_hours: float = 12, retries: int = 2) -> pd.DataFrame
         raise ValueError(f"no Yahoo data for {name} ({yahoo_symbol(name)})")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = _clean(df)
+    df = _report(name, _clean(df))
     if df.attrs.get("bad_ticks"):
         print(f"  {name}: dropped bad bars from Yahoo on {df.attrs['bad_ticks']}",
               file=sys.stderr)
     df = drop_live_bar(df)
     DATA_DIR.mkdir(exist_ok=True)
     df.to_csv(path, index_label="Date")
+    return df
+
+
+def _report(name: str, df: pd.DataFrame, since: str = "2010") -> pd.DataFrame:
+    """Print the price adjustments made since `since` (older ones are mostly
+    Yahoo's pre-2006 junk, far outside any test window)."""
+    for note in df.attrs.get("adjusted", []):
+        if note[:10] >= since:
+            print(f"  {name}: {note}", file=sys.stderr)
     return df
 
 

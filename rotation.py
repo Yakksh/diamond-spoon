@@ -271,6 +271,19 @@ def main() -> None:
     print(f"Loading {len(names)} stocks + {universe.BENCHMARK}...", file=sys.stderr)
     data = universe.load_many(names + [universe.BENCHMARK], nse_fallback=args.pit)
     bench = data.pop(universe.BENCHMARK)
+    if args.pit:   # Yahoo may only know a renamed stock from its new name's start date
+        first = uni.groupby("stock")["date"].min()
+        for name in [n for n in data if data[n].index[0] > first[n] - pd.DateOffset(years=1)]:
+            try:
+                rebuilt, notes = nse.price_series(name)
+            except ValueError:
+                continue
+            if rebuilt.index[0] < data[name].index[0]:
+                print(f"  {name}: Yahoo starts {data[name].index[0].date()}, using NSE's "
+                      f"files from {rebuilt.index[0].date()}", file=sys.stderr)
+                for note in notes:
+                    print(f"    {note}", file=sys.stderr)
+                data[name] = rebuilt
     missing = sorted(set(names) - set(data))
     closes = pd.DataFrame({n: df["Close"] for n, df in data.items()}).sort_index()
     opens = pd.DataFrame({n: df["Open"] for n, df in data.items()}).reindex(closes.index)

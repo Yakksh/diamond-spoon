@@ -28,8 +28,8 @@ list of stocks with futures on each month's last trading day.
 
 Usage
   python nse.py download                        # ~2,700 small files since 2016; resumable
-  python nse.py build --top 50                  # -> data/nse/universe.csv
-  python nse.py check                           # overlap with today's Nifty 50
+  python nse.py build --top 100                 # -> data/nse/universe.csv
+  python nse.py check --size 100                # overlap with today's Nifty 100
 """
 
 from __future__ import annotations
@@ -238,15 +238,19 @@ def _price_rows() -> tuple[pd.DataFrame, pd.Series]:
     return rows, link_ids(rows)
 
 
-def price_series(stock: str, tol: float = 0.02) -> tuple[pd.DataFrame, list[str]]:
+def price_series(stock: str, tol: float = 0.05,
+                 big_gap: float = 0.40) -> tuple[pd.DataFrame, list[str]]:
     """Daily Open/Close for a stock Yahoo no longer carries, from NSE's files,
-    adjusted for bonuses and splits, plus a note for every adjustment made.
+    adjusted for corporate actions, plus a note for every adjustment made.
 
-    NSE's prices are not adjusted, so a 1:1 bonus looks like a 50% crash. An
-    overnight drop is treated as a bonus or split when it is within `tol` of one
-    of SPLIT_RATIOS and either the ISIN changed that day (splits change it) or
-    the price held at the new level for the next 5 days; anything else is left as
-    a real move. Dividends are not added back, so returns are slightly too low."""
+    NSE's prices are not adjusted, so a 1:1 bonus looks like a 50% crash. The
+    previous prices are scaled down when the open gaps down and the price then
+    stays down (the next 5 closes) or the ISIN changes, and either
+      * the gap is within `tol` of a bonus/split ratio (SPLIT_RATIOS), or
+      * the gap is `big_gap` (40%) or more: a demerger, e.g. PEL on 30 Aug 2022.
+        NSE's price bands stop a stock opening 40% lower on news alone.
+    Everything else is left as a real move. Dividends are not added back, so
+    returns are slightly too low."""
     rows, ids = _price_rows()
     mine = rows[rows["symbol"].map(ids) == stock].sort_values("date")
     mine = mine.drop_duplicates("date", keep="first").set_index("date")
@@ -258,37 +262,43 @@ def price_series(stock: str, tol: float = 0.02) -> tuple[pd.DataFrame, list[str]
     gap = (o / c.shift()).to_numpy()
     for i in range(1, len(mine)):
         near = [r for r in SPLIT_RATIOS if abs(gap[i] / r - 1) < tol]
-        if not near:
+        if near:
+            ratio, kind, ceiling = near[0], "a bonus/split", near[0] * 1.25
+        elif gap[i] <= 1 - big_gap:
+            ratio, kind, ceiling = gap[i], "a demerger or similar", 0.8
+        else:
             continue
         new_isin = mine["isin"].iloc[i] != mine["isin"].iloc[i - 1]
-        held = (c.iloc[i:i + 5] / c.iloc[i - 1] < near[0] * 1.25).all()
+        held = (c.iloc[i:i + 5] / c.iloc[i - 1] < ceiling).all()
         if new_isin or held:
-            factor.iloc[:i] *= near[0]
-            notes.append(f"{stock} {mine.index[i].date()}: price x{near[0]:.3f} overnight "
-                         f"({'ISIN changed' if new_isin else 'held at the new level'}) "
-                         f"-> treated as a bonus/split")
+            factor.iloc[:i] *= ratio
+            notes.append(f"{stock} {mine.index[i].date()}: opened at x{gap[i]:.3f} the "
+                         f"previous close ({'ISIN changed' if new_isin else 'stayed down'}) "
+                         f"-> treated as {kind}, earlier prices scaled by {ratio:.3f}")
     out = pd.DataFrame({"Open": o * factor, "Close": c * factor})
     return out, notes
 
 
-def check() -> None:
+def current_index(size: int) -> set[str]:
+    """Today's Nifty 50 / 100 / 200 members, from NSE's archive."""
+    req = urllib.request.Request(f"{ARCHIVE}/indices/ind_nifty{size}list.csv",
+                                 headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return set(pd.read_csv(r)["Symbol"])
+
+
+def check(size: int = 50) -> None:
     uni = load_universe()
+    uni = uni[uni["rank"] <= size]
     latest = uni[uni["date"] == uni["date"].max()]
-    raw = _fetch(f"{ARCHIVE}/indices/ind_nifty50list.csv")
-    nifty = set(pd.read_csv(io.BytesIO(raw))["Symbol"]) if raw else None
-    if nifty is None:   # the list is a plain CSV, not a zip
-        req = urllib.request.Request(f"{ARCHIVE}/indices/ind_nifty50list.csv",
-                                     headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=40) as r:
-            nifty = set(pd.read_csv(r)["Symbol"])
+    index = current_index(size if size in (50, 100, 200) else 50)
     ours = set(latest["stock"])
-    print(f"Proxy list on {latest['date'].iloc[0].date()} vs today's Nifty 50: "
-          f"{len(ours & nifty)} of {len(nifty)} in common")
-    print("  in the Nifty, not in the proxy:", ", ".join(sorted(nifty - ours)))
-    print("  in the proxy, not in the Nifty:", ", ".join(sorted(ours - nifty)))
-    ever = uni.groupby("stock")["date"].agg(["min", "max", "count"])
-    print(f"\n{len(ever)} different stocks were in the proxy at some month end "
-          f"({uni['date'].min().date()} -> {uni['date'].max().date()}).")
+    print(f"Top-{size} list on {latest['date'].iloc[0].date()} vs today's Nifty "
+          f"{len(index)}: {len(ours & index)} in common")
+    print("  in the index, not on the list:", ", ".join(sorted(index - ours)))
+    print("  on the list, not in the index:", ", ".join(sorted(ours - index)))
+    print(f"\n{uni['stock'].nunique()} different stocks were on the top-{size} list at some "
+          f"month end ({uni['date'].min().date()} -> {uni['date'].max().date()}).")
 
 
 def main() -> None:
@@ -299,8 +309,9 @@ def main() -> None:
     dl.add_argument("--end", default=str(pd.Timestamp.now(tz="Asia/Kolkata").date()))
     dl.add_argument("--workers", type=int, default=4)
     b = sub.add_parser("build")
-    b.add_argument("--top", type=int, default=50)
-    sub.add_parser("check")
+    b.add_argument("--top", type=int, default=100)
+    c = sub.add_parser("check")
+    c.add_argument("--size", type=int, default=50)
     args = ap.parse_args()
     if args.cmd == "download":
         download(pd.Timestamp(args.start), pd.Timestamp(args.end), args.workers)
@@ -309,7 +320,7 @@ def main() -> None:
         print(f"{uni['date'].nunique()} month ends, {uni['stock'].nunique()} different "
               f"stocks -> {UNIVERSE_CSV}")
     else:
-        check()
+        check(args.size)
 
 
 if __name__ == "__main__":

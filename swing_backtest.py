@@ -128,7 +128,37 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     out = df[keep].apply(pd.to_numeric, errors="coerce").dropna()
     out = out[(out > 0).all(axis=1)]
     out.index = pd.to_datetime(out.index).tz_localize(None)
-    return drop_bad_ticks(out)
+    bad = drop_bad_ticks(out)
+    out = adjust_big_gaps(bad)
+    out.attrs["bad_ticks"] = bad.attrs["bad_ticks"]
+    return out
+
+
+def adjust_big_gaps(df: pd.DataFrame, gap: float = 0.30, hold: float = 0.8) -> pd.DataFrame:
+    """Scale earlier prices down at an overnight drop Yahoo did not adjust for.
+
+    Yahoo adjusts bonuses and splits but often not demergers: Tata Motors opens
+    39% lower on 14 Oct 2025, Strides 56% lower on 6 Dec 2024. Holders lost
+    nothing - they got shares in the new company. When the open is `gap` (30%)
+    or more below the previous close and the next 5 closes stay below `hold` x
+    that close, the drop is treated as such an action. NSE's price bands make an
+    open that far down nearly impossible on news alone. Smaller unadjusted
+    actions (CONCOR's 1:4 bonus, -20%) cannot be told from a real lower-circuit
+    day and are left alone. Adjustments are listed in df.attrs["adjusted"]."""
+    if "Open" not in df or len(df) < 2:
+        return df
+    o, c = df["Open"].to_numpy(), df["Close"].to_numpy()
+    factor = np.ones(len(df))
+    notes = []
+    for i in np.flatnonzero(o[1:] / c[:-1] <= 1 - gap) + 1:
+        ratio = o[i] / c[i - 1]
+        if (c[i:i + 5] / c[i - 1] < hold).all():
+            factor[:i] *= ratio
+            notes.append(f"{df.index[i].date()}: opened at x{ratio:.3f} the previous close "
+                         f"and stayed down; earlier prices scaled to match (demerger/bonus)")
+    out = df.mul(factor, axis=0)
+    out.attrs = {**df.attrs, "adjusted": notes}
+    return out
 
 
 def drop_bad_ticks(df: pd.DataFrame, factor: float = 1.8, max_len: int = 3) -> pd.DataFrame:

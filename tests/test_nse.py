@@ -102,8 +102,10 @@ def test_bonus_and_split_are_adjusted_but_a_crash_that_rebounds_is_not(tmp_path,
             {"symbol": "SPLITCO", "isin": "I3" if after else "I2", "px": 20.0 if after else 100.0},
             # halves for a day, then back near 90: a real move, not a bonus
             {"symbol": "CRASHCO", "isin": "I4", "px": 50.0 if i == 20 else (90.0 if after else 100.0)},
+            # demerger: opens 45% lower and stays there
+            {"symbol": "DEMERGCO", "isin": "I5", "px": 55.0 if after else 100.0},
         ]
-        for r in rows[-3:]:
+        for r in rows[-4:]:
             r.update(date=d, series="EQ", open=r["px"], close=r["px"])
     df = pd.DataFrame(rows).drop(columns="px")
     df.to_parquet(tmp_path / "cm" / "2020-01.parquet", index=False)
@@ -114,4 +116,6 @@ def test_bonus_and_split_are_adjusted_but_a_crash_that_rebounds_is_not(tmp_path,
     assert split["Close"].nunique() == 1 and "ISIN changed" in notes[0]
     crash, notes = nse.price_series("CRASHCO")
     assert notes == [] and crash["Close"].min() == 50.0
+    demerged, notes = nse.price_series("DEMERGCO")
+    assert np.allclose(demerged["Close"], 55.0) and "demerger" in notes[0]
     nse._price_rows.cache_clear()

@@ -113,3 +113,18 @@ def test_momentum_holds_the_leader_and_ignores_the_future():
     cut_decide, _ = rot.momentum_decider(closes.iloc[:401], top=2, exit_rank=2,
                                          lookback=252, skip=21)
     assert decide(400, ["S1"], set(closes.columns)) == cut_decide(400, ["S1"], set(closes.columns))
+
+
+def test_unadjusted_demerger_is_scaled_but_real_drops_are_not():
+    df = walk(60, seed=8, vol=0.005)
+    demerger = df.copy()
+    demerger.iloc[30:] *= 0.6                             # opens 40% lower, stays there
+    out = sb.adjust_big_gaps(demerger)
+    assert len(out.attrs["adjusted"]) == 1
+    assert out["Open"].iloc[30] / out["Close"].iloc[29] == pytest.approx(1.0)
+    rebound = df.copy()
+    rebound.iloc[30:32] *= 0.6                            # two bad days, then back
+    assert sb.adjust_big_gaps(rebound).attrs["adjusted"] == []
+    circuit = df.copy()
+    circuit.iloc[30:] *= 0.8                              # a real -20% day that holds
+    assert sb.adjust_big_gaps(circuit).attrs["adjusted"] == []
